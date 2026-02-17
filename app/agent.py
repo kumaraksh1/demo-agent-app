@@ -1,12 +1,17 @@
 """
 LangChain Agent with Azure OpenAI and OpenTelemetry tracing.
-Uses OTel GenAI semantic conventions so Azure Monitor Agents (preview) blade works.
+Uses a LangChain callback handler to capture token usage and emit
+OTel GenAI semantic convention spans + metrics so the Azure Monitor
+Gen AI (preview) dashboard works end-to-end.
 """
 import os
-from typing import Optional
+from typing import Any, Optional
+from uuid import UUID
 from langchain_openai import AzureChatOpenAI
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.outputs import LLMResult
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 from app.telemetry import get_tracer, get_token_usage_metric
@@ -40,104 +45,125 @@ Question: {input}
 Thought:{agent_scratchpad}"""
 
 
-def _extract_token_usage(result, span):
-    """Extract token usage from LangChain LLMResult and set span attributes + record metrics."""
-    input_tokens = 0
-    output_tokens = 0
-    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "unknown")
+class OpenTelemetryCallbackHandler(BaseCallbackHandler):
+    """LangChain callback handler that creates OTel GenAI spans and records
+    token-usage metrics for every LLM call."""
 
-    # Try generation-level info first
-    if result.generations and len(result.generations) > 0:
-        gen = result.generations[0][0] if isinstance(result.generations[0], list) else result.generations[0]
-        if hasattr(gen, 'generation_info') and gen.generation_info:
-            info = gen.generation_info
-            if 'token_usage' in info:
-                input_tokens = info['token_usage'].get('prompt_tokens', 0)
-                output_tokens = info['token_usage'].get('completion_tokens', 0)
+    def __init__(self, model_name: str = "unknown"):
+        super().__init__()
+        self.model_name = model_name
+        # Map run_id -> span so on_llm_end can close the right span
+        self._spans: dict[UUID, Any] = {}
 
-    # Try llm_output (aggregated) – usually more reliable
-    if hasattr(result, 'llm_output') and result.llm_output:
-        if 'model_name' in result.llm_output:
-            model_name = result.llm_output['model_name']
-            span.set_attribute("gen_ai.response.model", model_name)
-        if 'token_usage' in result.llm_output:
-            usage = result.llm_output['token_usage']
-            input_tokens = usage.get('prompt_tokens', 0)
-            output_tokens = usage.get('completion_tokens', 0)
-
-    # Set span attributes (for trace-level visibility)
-    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-
-    # Record metrics (for Azure Monitor Token Consumption dashboards)
-    common_attrs = {
-        "gen_ai.request.model": model_name,
-        "gen_ai.system": AZURE_OPENAI_PROVIDER,
-        "gen_ai.operation.name": "chat",
-    }
-    if input_tokens:
-        token_usage_histogram.record(
-            input_tokens,
-            {**common_attrs, "gen_ai.token.type": "input"},
-        )
-    if output_tokens:
-        token_usage_histogram.record(
-            output_tokens,
-            {**common_attrs, "gen_ai.token.type": "output"},
-        )
-
-
-class TracedAzureChatOpenAI(AzureChatOpenAI):
-    """Azure OpenAI chat model with OpenTelemetry GenAI semantic convention tracing."""
-
-    def _create_chat_span(self):
-        """Start a CLIENT span named 'chat <model>' per GenAI semconv."""
-        model = self.deployment_name or "unknown"
+    # ── LLM start ──────────────────────────────────────────────────────
+    def on_llm_start(self, serialized: dict, prompts: list[str], *,
+                     run_id: UUID, **kwargs) -> None:
         span = tracer.start_span(
-            f"chat {model}",
+            f"chat {self.model_name}",
             kind=SpanKind.CLIENT,
             attributes={
                 "gen_ai.operation.name": "chat",
                 "gen_ai.system": AZURE_OPENAI_PROVIDER,
                 "gen_ai.provider.name": AZURE_OPENAI_PROVIDER,
-                "gen_ai.request.model": model,
-                "gen_ai.request.temperature": self.temperature or 0.7,
+                "gen_ai.request.model": self.model_name,
                 "server.address": os.getenv("AZURE_OPENAI_ENDPOINT", ""),
             },
         )
-        return span
-
-    def _generate(self, *args, **kwargs):
-        span = self._create_chat_span()
         ctx = trace.set_span_in_context(span)
         token = trace.context_api.attach(ctx)
-        try:
-            result = super()._generate(*args, **kwargs)
-            _extract_token_usage(result, span)
-            return result
-        except Exception as exc:
-            span.set_attribute("error.type", type(exc).__name__)
-            span.record_exception(exc)
-            raise
-        finally:
-            span.end()
-            trace.context_api.detach(token)
+        self._spans[run_id] = (span, token)
 
-    async def _agenerate(self, *args, **kwargs):
-        span = self._create_chat_span()
-        ctx = trace.set_span_in_context(span)
-        token = trace.context_api.attach(ctx)
-        try:
-            result = await super()._agenerate(*args, **kwargs)
-            _extract_token_usage(result, span)
-            return result
-        except Exception as exc:
-            span.set_attribute("error.type", type(exc).__name__)
-            span.record_exception(exc)
-            raise
-        finally:
-            span.end()
-            trace.context_api.detach(token)
+    # ── LLM end (success) ─────────────────────────────────────────────
+    def on_llm_end(self, response: LLMResult, *, run_id: UUID,
+                   **kwargs) -> None:
+        entry = self._spans.pop(run_id, None)
+        if entry is None:
+            return
+        span, ctx_token = entry
+
+        input_tokens = 0
+        output_tokens = 0
+        model = self.model_name
+
+        # --- Strategy 1: llm_output.token_usage (set by agenerate) ---
+        if response.llm_output:
+            usage = response.llm_output.get("token_usage") or {}
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            m = response.llm_output.get("model_name")
+            if m:
+                model = m
+
+        # --- Strategy 2: AIMessage.response_metadata.token_usage ---
+        if input_tokens == 0 and response.generations:
+            gen_list = response.generations[0]
+            if gen_list:
+                gen = gen_list[0] if isinstance(gen_list, list) else gen_list
+                msg = getattr(gen, "message", None)
+                if msg is not None:
+                    # response_metadata (dict) contains token_usage
+                    meta = getattr(msg, "response_metadata", None) or {}
+                    tu = meta.get("token_usage") or {}
+                    if tu:
+                        input_tokens = tu.get("prompt_tokens", 0)
+                        output_tokens = tu.get("completion_tokens", 0)
+                    m = meta.get("model_name")
+                    if m:
+                        model = m
+
+        # --- Strategy 3: AIMessage.usage_metadata (pydantic or dict) ---
+        if input_tokens == 0 and response.generations:
+            gen_list = response.generations[0]
+            if gen_list:
+                gen = gen_list[0] if isinstance(gen_list, list) else gen_list
+                msg = getattr(gen, "message", None)
+                if msg is not None:
+                    um = getattr(msg, "usage_metadata", None)
+                    if um is not None:
+                        # Could be a dict or a pydantic UsageMetadata object
+                        if isinstance(um, dict):
+                            input_tokens = um.get("input_tokens", 0)
+                            output_tokens = um.get("output_tokens", 0)
+                        else:
+                            input_tokens = getattr(um, "input_tokens", 0)
+                            output_tokens = getattr(um, "output_tokens", 0)
+
+        # Set span attributes
+        span.set_attribute("gen_ai.response.model", model)
+        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+        # Record histogram metrics for Token Consumption dashboards
+        common_attrs = {
+            "gen_ai.request.model": model,
+            "gen_ai.system": AZURE_OPENAI_PROVIDER,
+            "gen_ai.operation.name": "chat",
+        }
+        if input_tokens:
+            token_usage_histogram.record(
+                input_tokens,
+                {**common_attrs, "gen_ai.token.type": "input"},
+            )
+        if output_tokens:
+            token_usage_histogram.record(
+                output_tokens,
+                {**common_attrs, "gen_ai.token.type": "output"},
+            )
+
+        span.end()
+        trace.context_api.detach(ctx_token)
+
+    # ── LLM error ─────────────────────────────────────────────────────
+    def on_llm_error(self, error: BaseException, *, run_id: UUID,
+                     **kwargs) -> None:
+        entry = self._spans.pop(run_id, None)
+        if entry is None:
+            return
+        span, ctx_token = entry
+        span.set_attribute("error.type", type(error).__name__)
+        span.record_exception(error)
+        span.end()
+        trace.context_api.detach(ctx_token)
 
 
 def create_agent() -> Optional[AgentExecutor]:
@@ -151,12 +177,15 @@ def create_agent() -> Optional[AgentExecutor]:
         print("Warning: Azure OpenAI credentials not configured")
         return None
 
-    llm = TracedAzureChatOpenAI(
+    otel_handler = OpenTelemetryCallbackHandler(model_name=deployment)
+
+    llm = AzureChatOpenAI(
         azure_endpoint=endpoint,
         api_key=api_key,
         deployment_name=deployment,
         api_version=api_version,
         temperature=0.7,
+        callbacks=[otel_handler],
     )
 
     prompt = PromptTemplate.from_template(REACT_PROMPT)
@@ -168,6 +197,7 @@ def create_agent() -> Optional[AgentExecutor]:
         verbose=True,
         handle_parsing_errors=True,
         max_iterations=5,
+        callbacks=[otel_handler],
     )
     return agent_executor
 
