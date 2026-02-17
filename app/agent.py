@@ -9,10 +9,11 @@ from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
-from app.telemetry import get_tracer
+from app.telemetry import get_tracer, get_token_usage_metric
 from app.tools import all_tools
 
 tracer = get_tracer("langchain-agent")
+token_usage_histogram = get_token_usage_metric()
 
 AZURE_OPENAI_PROVIDER = "azure.ai.openai"
 
@@ -40,25 +41,50 @@ Thought:{agent_scratchpad}"""
 
 
 def _extract_token_usage(result, span):
-    """Extract token usage from LangChain LLMResult and set span attributes."""
+    """Extract token usage from LangChain LLMResult and set span attributes + record metrics."""
+    input_tokens = 0
+    output_tokens = 0
+    model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "unknown")
+
     # Try generation-level info first
     if result.generations and len(result.generations) > 0:
         gen = result.generations[0][0] if isinstance(result.generations[0], list) else result.generations[0]
         if hasattr(gen, 'generation_info') and gen.generation_info:
             info = gen.generation_info
             if 'token_usage' in info:
-                span.set_attribute("gen_ai.usage.input_tokens",
-                                   info['token_usage'].get('prompt_tokens', 0))
-                span.set_attribute("gen_ai.usage.output_tokens",
-                                   info['token_usage'].get('completion_tokens', 0))
-    # Try llm_output (aggregated)
+                input_tokens = info['token_usage'].get('prompt_tokens', 0)
+                output_tokens = info['token_usage'].get('completion_tokens', 0)
+
+    # Try llm_output (aggregated) – usually more reliable
     if hasattr(result, 'llm_output') and result.llm_output:
         if 'model_name' in result.llm_output:
-            span.set_attribute("gen_ai.response.model", result.llm_output['model_name'])
+            model_name = result.llm_output['model_name']
+            span.set_attribute("gen_ai.response.model", model_name)
         if 'token_usage' in result.llm_output:
             usage = result.llm_output['token_usage']
-            span.set_attribute("gen_ai.usage.input_tokens", usage.get('prompt_tokens', 0))
-            span.set_attribute("gen_ai.usage.output_tokens", usage.get('completion_tokens', 0))
+            input_tokens = usage.get('prompt_tokens', 0)
+            output_tokens = usage.get('completion_tokens', 0)
+
+    # Set span attributes (for trace-level visibility)
+    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+    # Record metrics (for Azure Monitor Token Consumption dashboards)
+    common_attrs = {
+        "gen_ai.request.model": model_name,
+        "gen_ai.system": AZURE_OPENAI_PROVIDER,
+        "gen_ai.operation.name": "chat",
+    }
+    if input_tokens:
+        token_usage_histogram.record(
+            input_tokens,
+            {**common_attrs, "gen_ai.token.type": "input"},
+        )
+    if output_tokens:
+        token_usage_histogram.record(
+            output_tokens,
+            {**common_attrs, "gen_ai.token.type": "output"},
+        )
 
 
 class TracedAzureChatOpenAI(AzureChatOpenAI):
@@ -119,7 +145,7 @@ def create_agent() -> Optional[AgentExecutor]:
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-06")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
     if not endpoint or not api_key:
         print("Warning: Azure OpenAI credentials not configured")

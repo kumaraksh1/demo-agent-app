@@ -2,11 +2,16 @@
 OpenTelemetry configuration with GenAI semantic conventions for Azure Monitor.
 """
 import os
-from opentelemetry import trace
+from opentelemetry import trace, metrics
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
-from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from azure.monitor.opentelemetry.exporter import (
+    AzureMonitorTraceExporter,
+    AzureMonitorMetricExporter,
+)
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 
@@ -59,12 +64,18 @@ def setup_telemetry(app=None):
     # Create tracer provider
     provider = TracerProvider(resource=resource)
     
-    # Configure Azure Monitor exporter
+    # Configure Azure Monitor trace exporter
     exporter = AzureMonitorTraceExporter(connection_string=connection_string)
     provider.add_span_processor(BatchSpanProcessor(exporter))
     
     # Set as global tracer provider
     trace.set_tracer_provider(provider)
+
+    # Configure Azure Monitor metric exporter + MeterProvider
+    metric_exporter = AzureMonitorMetricExporter(connection_string=connection_string)
+    metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=60000)
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(meter_provider)
     
     # Instrument FastAPI if app is provided
     if app:
@@ -77,3 +88,17 @@ def setup_telemetry(app=None):
 def get_tracer(name: str = "demo-agent-app"):
     """Get a tracer instance."""
     return trace.get_tracer(name)
+
+
+def get_token_usage_metric():
+    """Return a Histogram instrument for GenAI token usage.
+
+    Metric name follows the OpenTelemetry GenAI semantic conventions so that
+    Azure Monitor's Gen AI dashboards can pick it up.
+    """
+    meter = metrics.get_meter("gen_ai")
+    return meter.create_histogram(
+        name="gen_ai.client.token.usage",
+        description="Measures the number of input and output tokens used",
+        unit="token",
+    )
