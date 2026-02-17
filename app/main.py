@@ -1,30 +1,24 @@
-"""
-FastAPI application for the Demo Agent Web App.
-"""
+"""FastAPI application for the Demo Agent Web App."""
 import os
-from fastapi import FastAPI, Request, Form
+
+from dotenv import load_dotenv
+load_dotenv()  # no-op when .env is absent (production)
+
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 from app.telemetry import setup_telemetry, get_tracer
 from app.agent import run_agent
 
-# Create FastAPI app
 app = FastAPI(
     title="Demo Agent Web App",
     description="LangChain Agent with Azure OpenAI and OpenTelemetry tracing",
-    version="1.0.0"
+    version="1.0.0",
 )
 
-# Setup templates
 templates = Jinja2Templates(directory="app/templates")
-
-# Setup telemetry after app creation
 tracer = setup_telemetry(app)
 
 
