@@ -5,6 +5,7 @@ gunicorn>=23.0.0,<24.0
 python-multipart>=0.0.9,<1.0
 jinja2>=3.1.4,<4.0
 
+
 # LangChain & Azure OpenAI
 langchain~=0.3.0
 langchain-openai~=0.2.0
