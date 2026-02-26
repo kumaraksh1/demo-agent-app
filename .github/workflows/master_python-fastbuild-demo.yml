@@ -44,4 +44,5 @@ jobs:
         with:
           app-name: 'python-fastbuild-demo'
           slot-name: 'Production'
+
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_5E529C98A96F416E8842383C4DEC0A0A }}
