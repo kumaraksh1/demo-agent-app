@@ -39,7 +39,7 @@ jobs:
           name: python-app
       
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@releases/v3
+        uses: azure/webapps-deploy@releases/v2
         id: deploy-to-webapp
         with:
           app-name: 'python-fastbuild-demo'
